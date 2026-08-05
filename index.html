@@ -154,6 +154,22 @@
     color:var(--cream);font-size:.95rem;min-height:44px;margin-top:10px;
     display:flex;align-items:center;justify-content:center;text-align:center;padding:0 10px;
   }
+
+  /* ---------------- PINCH CONTROL (camera only) ---------------- */
+  .camStage{max-width:760px;margin:0 auto;text-align:center}
+  .camBox{
+    background:var(--cream);border:4px solid var(--ink);border-radius:20px;
+    box-shadow:5px 5px 0 var(--ink);padding:8px;display:inline-block;line-height:0;max-width:100%;
+  }
+  .camBox canvas{
+    display:block;border-radius:12px;background:#2b1a22;
+    width:100%;max-width:720px;height:auto;
+  }
+  .pinchTrack{height:16px;background:#e3d3b8;border:3px solid var(--ink);border-radius:40px;overflow:hidden;margin:16px auto 6px;max-width:420px}
+  .pinchFill{height:100%;background:var(--pink);width:0%}
+  .pinchFill.low{background:var(--pink-dark)}
+  .camState{color:var(--cream);font-size:.95rem;min-height:26px;text-align:center;margin-top:8px}
+  .note{color:#e9d9dd;opacity:.65;font-size:.8rem;line-height:1.6;max-width:560px;margin:18px auto 0;text-align:center}
 </style>
 </head>
 <body>
@@ -176,6 +192,10 @@
     <button class="tile" onclick="startBorder()">
       <h3>Guess the Border</h3><p>name as many as you can before it shrinks away</p>
       <span class="best" id="mbBorder">&nbsp;</span>
+    </button>
+    <button class="tile" onclick="startHand()">
+      <h3>Pinch Control</h3><p>camera on. pinch your fingers to stretch your own forehead</p>
+      <span class="best" id="mbHand">&nbsp;</span>
     </button>
   </div>
   <div class="foot">
@@ -264,6 +284,29 @@
         <div class="center gameCanvasBox"><canvas id="cClick" width="440" height="560"></canvas></div>
         <div class="popup" id="nLine" style="color:#5a3b42">&nbsp;</div>
         <div class="center"><button class="cta" id="nBtn" onclick="clickStart()">START</button></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= PINCH CONTROL ================= -->
+<section id="hand" class="view">
+  <button class="back" onclick="showView('menu')">← menu</button>
+  <div class="gamewrap">
+    <div class="gtitle">Pinch Control</div>
+    <div class="gsub">hold up one hand. spread your thumb and index finger to grow your forehead — touch them together and it's gone.</div>
+    <div class="camStage">
+      <div class="camBox"><canvas id="cCam" width="720" height="540"></canvas></div>
+      <div class="pinchTrack"><div class="pinchFill" id="hPinch"></div></div>
+      <div class="camState" id="hState">camera is off</div>
+      <div class="center" style="margin-top:14px">
+        <button class="cta" id="hBtn" onclick="handToggle()">TURN CAMERA ON</button>
+      </div>
+      <div class="note">
+        The video is processed entirely on your own machine and is never uploaded or recorded.
+        Turning the camera off — or leaving this page, or switching tabs — releases it immediately.
+        Hand and face tracking (about 11MB) download from Google's MediaPipe CDN the first time
+        you switch it on, then stay cached.
       </div>
     </div>
   </div>
@@ -433,6 +476,7 @@ function showView(id){
   if(id!=='strike' && typeof st!=='undefined'){ cancelAnimationFrame(st.raf); st.phase='idle'; }
   if(id!=='stack'  && typeof sk!=='undefined'){ cancelAnimationFrame(sk.raf); sk.phase='idle'; }
   if(id!=='click'  && typeof nk!=='undefined'){ nk.running=false; clearInterval(nk.tId); cancelAnimationFrame(nk.raf); }
+  if(id!=='hand'   && typeof hd!=='undefined' && (hd.running||hd.loading)) handStop();  // never leave the camera on
   if(id==='menu') refreshBests();
   window.scrollTo(0,0);
 }
@@ -449,12 +493,14 @@ function bestOf(k){ return STORE.get(k,0); }
 function recordBest(k,v){ if(v>bestOf(k)){ STORE.set(k,v); } refreshBests(); }
 function refreshBests(){
   const set=(id,txt)=>{const el=document.getElementById(id); if(el) el.innerHTML=txt;};
-  const f=bestOf('flag'), b=bestOf('border'), s=bestOf('strike'), k=bestOf('stack'), n=bestOf('click');
+  const f=bestOf('flag'), b=bestOf('border'), s=bestOf('strike'), k=bestOf('stack'),
+        n=bestOf('click'), h=bestOf('hand');
   set('mbFlag',   f? 'best: '+f+'/10' : '&nbsp;');
   set('mbBorder', b? 'best run: '+b+' countries' : '&nbsp;');
+  set('mbHand',   h? 'biggest reached: '+h+'%' : '&nbsp;');
   const car=[s?'striker '+s+'%':'', k?'stack '+k:'', n?'frenzy '+n:''].filter(Boolean).join(' · ');
   set('mbCarnival', car||'&nbsp;');
-  set('bbStrike', s? 'best hit: '+s+'%' : '&nbsp;');
+  set('bbStrike', s? 'best total: '+s+'% / 300%' : '&nbsp;');
   set('bbStack',  k? 'best: '+k+' floors' : '&nbsp;');
   set('bbClick',  n? 'best: '+n+' clicks' : '&nbsp;');
   set('sBest', s); set('kBest', k); set('nBest', n);
@@ -881,6 +927,181 @@ window.addEventListener('keydown',e=>{
 });
 
 /* =====================================================================
+   PINCH CONTROL — webcam only. Your own forehead stretches live.
+   The thumb-to-index gap is divided by the wrist-to-knuckle span so the
+   reading holds steady whether your hand is near or far from the lens.
+   Everything runs locally; no frame ever leaves the machine.
+   ===================================================================== */
+const CAMW=720, CAMH=540;
+const MP_VER='0.10.14';
+const PINCH_MIN=0.14, PINCH_MAX=1.45;   // normalised gap: touching -> wide open
+const FACE_MIN=0.15,  FACE_MAX=2.9;     // resulting forehead stretch
+const LM_TOP=10, LM_BROW_L=105, LM_BROW_R=334;   // face-mesh: hairline, mid-brows
+
+/* One Euro filter — the standard fix for landmark jitter. A plain
+   average either shakes (too loose) or lags behind your hand (too tight);
+   this one smooths hard while you hold still and loosens the moment you
+   actually move, so it's steady AND responsive. */
+function oneEuro(minCutoff,beta){
+  let x=null,dx=0,tPrev=0;
+  const alpha=(cut,dt)=>{const r=2*Math.PI*cut*dt;return r/(r+1);};
+  return (v,t)=>{
+    if(x===null){x=v;tPrev=t;return v;}
+    const dt=Math.min(0.1,Math.max(0.001,(t-tPrev)/1000)); tPrev=t;
+    const rate=(v-x)/dt;
+    dx += alpha(1,dt)*(rate-dx);
+    x  += alpha(minCutoff+beta*Math.abs(dx),dt)*(v-x);
+    return x;
+  };
+}
+const fGap=oneEuro(1.1,0.02);                       // the pinch value
+const fTop=oneEuro(0.9,0.007), fBrow=oneEuro(0.9,0.007);   // face bands
+const fTx=oneEuro(1.6,0.02), fTy=oneEuro(1.6,0.02);        // thumb dot
+const fIx=oneEuro(1.6,0.02), fIy=oneEuro(1.6,0.02);        // index dot
+
+const hd={running:false,loading:false,lm:null,fm:null,video:null,stream:null,raf:null,
+          factor:1,face:null,hand:null,msgShown:false,peak:0,seen:false,lastT:-1};
+function handSet(s){ const el=document.getElementById('hState'); if(el) el.textContent=s; }
+function startHand(){ showView('hand'); handDraw(); }
+async function handToggle(){
+  if(hd.running||hd.loading){ handStop(); return; }
+  const btn=document.getElementById('hBtn');
+  hd.loading=true; btn.textContent='STARTING…';
+  handSet('loading hand tracking…');
+  try{
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia) throw new Error('no-camera-api');
+    if(!hd.lm){
+      const vision=await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}`);
+      const fileset=await vision.FilesetResolver.forVisionTasks(
+        `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm`);
+      const handOpts=d=>({baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:d},runningMode:'VIDEO',numHands:1});
+      const faceOpts=d=>({baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',delegate:d},runningMode:'VIDEO',numFaces:1,outputFaceBlendshapes:false,outputFacialTransformationMatrixes:false});
+      let dg='GPU';
+      try{ hd.lm=await vision.HandLandmarker.createFromOptions(fileset,handOpts('GPU')); }
+      catch(e){ dg='CPU'; hd.lm=await vision.HandLandmarker.createFromOptions(fileset,handOpts('CPU')); }
+      handSet('loading face tracking…');
+      try{ hd.fm=await vision.FaceLandmarker.createFromOptions(fileset,faceOpts(dg)); }
+      catch(e){ hd.fm=await vision.FaceLandmarker.createFromOptions(fileset,faceOpts('CPU')); }
+    }
+    handSet('asking for the camera…');
+    hd.stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720},facingMode:'user'}});
+    if(!hd.video){ hd.video=document.createElement('video'); hd.video.playsInline=true; hd.video.muted=true; }
+    hd.video.srcObject=hd.stream;
+    await hd.video.play();
+    hd.running=true; hd.loading=false; hd.lastT=-1; hd.seen=false; hd.peak=0;
+    btn.textContent='TURN CAMERA OFF';
+    handSet('show me one hand');
+    handLoop();
+  }catch(err){
+    hd.loading=false; handStop(true);
+    handSet( err&&err.name==='NotAllowedError'
+        ? 'Camera permission was declined — allow it in the address bar and try again.'
+      : err&&err.name==='NotFoundError' ? 'No camera found on this device.'
+      : (err&&err.message==='no-camera-api')||!window.isSecureContext
+        ? 'Camera needs a secure page (https:// or localhost). It will work once this is hosted.'
+        : "Couldn't start tracking — check the connection and try again." );
+  }
+}
+function handStop(quiet){
+  if(hd.peak>0.05) recordBest('hand',Math.round(hd.peak*100));
+  hd.peak=0; hd.running=false; hd.loading=false;
+  hd.face=null; hd.hand=null; hd.msgShown=false; hd.factor=1;
+  cancelAnimationFrame(hd.raf);
+  if(hd.stream){ hd.stream.getTracks().forEach(t=>t.stop()); hd.stream=null; }  // releases the light
+  if(hd.video) hd.video.srcObject=null;
+  const btn=document.getElementById('hBtn');
+  if(btn) btn.textContent='TURN CAMERA ON';
+  if(!quiet) handSet('camera is off');
+  handDraw();
+}
+function handLoop(){
+  if(!hd.running) return;
+  const v=hd.video, now=performance.now();
+  if(v&&v.readyState>=2&&v.currentTime!==hd.lastT){
+    hd.lastT=v.currentTime;
+    try{
+      const r=hd.lm.detectForVideo(v,now);
+      if(r&&r.landmarks&&r.landmarks.length){
+        const L=r.landmarks[0];
+        const d=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y,(a.z||0)-(b.z||0));
+        const span=d(L[0],L[9])||1e-4;
+        const gap=fGap(d(L[4],L[8])/span,now);            // filtered, not raw
+        const t=Math.max(0,Math.min(1,(gap-PINCH_MIN)/(PINCH_MAX-PINCH_MIN)));
+        hd.factor=FACE_MIN+t*(FACE_MAX-FACE_MIN);
+        hd.hand={tx:fTx(L[4].x,now),ty:fTy(L[4].y,now),ix:fIx(L[8].x,now),iy:fIy(L[8].y,now)};
+        hd.seen=true;
+        if(!hd.msgShown){ handSet('tracking — pinch to shrink, spread to grow'); hd.msgShown=true; }
+      }else{
+        hd.hand=null;
+        if(hd.msgShown){ handSet('show me one hand'); hd.msgShown=false; }
+      }
+    }catch(e){}
+    try{
+      const fr=hd.fm&&hd.fm.detectForVideo(v,now);
+      if(fr&&fr.faceLandmarks&&fr.faceLandmarks.length){
+        const F=fr.faceLandmarks[0];
+        const yT=fTop(F[LM_TOP].y*CAMH,now);
+        const yB=fBrow(((F[LM_BROW_L].y+F[LM_BROW_R].y)/2)*CAMH,now);
+        hd.face=(yB-yT>4)?{yTop:yT,yBrow:yB}:null;
+      }else hd.face=null;
+    }catch(e){}
+  }
+  if(hd.seen) hd.peak=Math.max(hd.peak,hd.factor);
+  handDraw();
+  hd.raf=requestAnimationFrame(handLoop);
+}
+/* Stretches the real forehead: rows below the eyebrows are untouched, the
+   brow-to-hairline band is scaled, and the hair above shifts to make room.
+   Bands run full width — a vertical stretch of a mostly-flat background is
+   effectively invisible, and it avoids a hard mask edge around the head. */
+function handDraw(){
+  const cam=document.getElementById('cCam'); if(!cam) return;
+  const cx=cam.getContext('2d');
+  cx.clearRect(0,0,CAMW,CAMH);
+  if(!(hd.running&&hd.video&&hd.video.readyState>=2)){
+    cx.fillStyle='#2b1a22'; cx.fillRect(0,0,CAMW,CAMH);
+    cx.fillStyle='#e9d9dd'; cx.font='20px Sriracha, cursive'; cx.textAlign='center';
+    cx.fillText('camera off',CAMW/2,CAMH/2);
+    const b0=document.getElementById('hPinch'); if(b0) b0.style.width='0%';
+    return;
+  }
+  const v=hd.video, vw=v.videoWidth, vh=v.videoHeight;
+  cx.save();
+  cx.scale(-1,1);                          // mirror once; every band is full width
+  const X=-CAMW, W=CAMW;
+  cx.drawImage(v,X,0,W,CAMH);
+  if(hd.face&&vw&&vh){
+    const {yTop,yBrow}=hd.face;
+    const foreH=yBrow-yTop;
+    const extra=foreH*(hd.factor-1);
+    const sy=r=>r*(vh/CAMH);
+    if(extra<0) cx.drawImage(v,0,0,vw,2, X,0,W,-extra+1);        // clamp gap when shrinking
+    cx.drawImage(v,0,sy(yTop),vw,sy(foreH), X,yTop-extra,W,foreH+extra);  // stretched forehead
+    cx.drawImage(v,0,0,vw,sy(yTop),        X,-extra,     W,yTop);         // hair shifted up
+  }
+  cx.restore();
+  if(hd.hand){
+    const th={x:CAMW-hd.hand.tx*CAMW,y:hd.hand.ty*CAMH};
+    const ix={x:CAMW-hd.hand.ix*CAMW,y:hd.hand.iy*CAMH};
+    cx.save();
+    cx.strokeStyle='rgba(255,248,228,.9)'; cx.lineWidth=5; cx.lineCap='round';
+    cx.beginPath(); cx.moveTo(th.x,th.y); cx.lineTo(ix.x,ix.y); cx.stroke();
+    [th,ix].forEach(p=>{
+      cx.beginPath(); cx.arc(p.x,p.y,10,0,Math.PI*2);
+      cx.fillStyle='#ff7882'; cx.fill();
+      cx.lineWidth=3; cx.strokeStyle='#333'; cx.stroke();
+    });
+    cx.restore();
+  }
+  const bar=document.getElementById('hPinch');
+  if(bar){
+    const p=(hd.factor-FACE_MIN)/(FACE_MAX-FACE_MIN);
+    bar.style.width=Math.max(0,Math.min(1,p))*100+'%';
+    bar.classList.toggle('low',hd.factor<0.5);
+  }
+}
+
+/* =====================================================================
    MENU — idle breathing forehead + rotating line
    ===================================================================== */
 (function menuIdle(){
@@ -1115,6 +1336,10 @@ drawForehead('cFlag',1);
 drawFaceFixed('cBorder',BFH_MAX);
 document.getElementById('menuLine').textContent=randOf(MENU_LINES);
 refreshBests();
+handDraw();
+// release the camera if the tab is hidden or the page goes away
+window.addEventListener('pagehide',()=>{ if(hd.running||hd.loading) handStop(true); });
+document.addEventListener('visibilitychange',()=>{ if(document.hidden&&(hd.running||hd.loading)) handStop(); });
 </script>
 </body>
 </html>
